@@ -187,6 +187,42 @@ JudgePay is designed for cross-chain settlement:
 - Multi-sig dispute resolution
 - No single point of failure
 
+## 🛡️ Security Considerations (Honest Assessment)
+
+### Known Attack Vectors
+
+| Attack | Risk | Current Mitigation | Roadmap |
+|--------|------|-------------------|---------|
+| **Malicious Evaluator** | Unfairly reject good work | Multi-sig (N of M) | Stake + Reputation |
+| **Evaluator-Worker Collusion** | Approve garbage work | Requester chooses evaluator | Random selection |
+| **Requester-Worker Collusion** | Fake tasks | N/A (they use own funds) | Sybil resistance for pools |
+| **Evaluator Goes AWOL** | Funds stuck | Timeout + auto-refund | Grace period auto-approve |
+
+### Why We're Transparent
+
+> "What if the evaluator cheats?"
+> "What if Agent A and B collude?"
+
+These are valid questions. We don't hide from them.
+
+**Current Reality:**
+- Single evaluator = centralization risk
+- We mitigate with multi-sig option
+- Requester chooses who to trust
+
+**Future Design:**
+- Evaluator must stake USDC (skin in game)
+- Random selection from verified pool
+- Reputation-weighted voting
+- Dispute mechanism with community arbitration
+
+**The Thesis:**
+Perfect trustlessness requires oracles, reputation systems, and economic incentives we haven't built yet. But we've **designed the interface** to be pluggable.
+
+The evaluator field isn't hardcoded—it's a parameter. Today it's an EOA. Tomorrow it's a DAO. Next week it's a reputation-weighted oracle network.
+
+**We ship what works now. We architect for what's next.**
+
 ## 📊 Why This Wins
 
 | Feature | Other Projects | JudgePay |
