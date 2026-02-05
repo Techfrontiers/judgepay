@@ -93,4 +93,17 @@ contract JudgePayLite {
         require(usdc.transfer(t.requester, t.amount), "Transfer failed");
         emit TaskRefunded(_id, t.amount);
     }
+    
+    /// @notice Claim funds if requester abandons after worker submitted
+    /// @dev Grace period: 48 hours after original deadline
+    function claimTimeoutAfterSubmit(uint256 _id) external {
+        Task storage t = tasks[_id];
+        require(t.status == Status.Submitted, "Not submitted");
+        require(block.timestamp > t.deadline + 48 hours, "Grace period active");
+        
+        // Worker gets paid - they did the work, requester abandoned
+        t.status = Status.Completed;
+        require(usdc.transfer(t.worker, t.amount), "Transfer failed");
+        emit TaskCompleted(_id, t.amount);
+    }
 }

@@ -32,7 +32,7 @@ Requester → [Lock USDC] → Contract → [Submit Work] → [Approve] → Worke
 
 | Contract | Address | Verified |
 |----------|---------|----------|
-| **JudgePayLite** | `0x941bb35BFf8314A20c739EC129d6F38ba73BD4E5` | ✅ |
+| **JudgePayLite** | `0xA5D4B9dFdFd8EEee1335336B8A5ba766De717e11` | ✅ |
 | **USDC (Official)** | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` | ✅ |
 
 ### Example Transactions (Real USDC!)
@@ -71,6 +71,9 @@ judgePay.reject(taskId);
 ```solidity
 // If no submission, requester can reclaim after deadline
 judgePay.claimTimeout(taskId);
+
+// If worker submitted but requester abandoned (48h grace period)
+judgePay.claimTimeoutAfterSubmit(taskId); // Worker gets paid
 ```
 
 ## 📁 Project Structure
