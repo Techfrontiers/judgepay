@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>JudgePay Demo</title>
+    <style>
+        body {
+            background: #1a1a2e;
+            padding: 20px;
+            margin: 0;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+        }
+        .terminal {
+            background: #0d1117;
+            border-radius: 12px;
+            padding: 20px 30px;
+            max-width: 700px;
+            margin: 0 auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            border: 1px solid #30363d;
+        }
+        .terminal-header {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #30363d;
+        }
+        .dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        .red { background: #ff5f56; }
+        .yellow { background: #ffbd2e; }
+        .green { background: #27c93f; }
+        .terminal-title {
+            color: #8b949e;
+            font-size: 13px;
+            margin-left: 20px;
+        }
+        pre {
+            color: #c9d1d9;
+            font-size: 13px;
+            line-height: 1.6;
+            margin: 0;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .highlight { color: #58a6ff; }
+        .success { color: #3fb950; }
+        .money { color: #f0c674; }
+        .header-box { color: #a371f7; }
+    </style>
+</head>
+<body>
+    <div class="terminal">
+        <div class="terminal-header">
+            <div class="dot red"></div>
+            <div class="dot yellow"></div>
+            <div class="dot green"></div>
+            <span class="terminal-title">JudgePay Demo — Base Sepolia (Real USDC)</span>
+        </div>
+        <pre><span class="header-box">╔═══════════════════════════════════════════════════════════════╗
+║  🏛️  J U D G E P A Y   D E M O                               ║
+║  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ║
+║  Financial Judgment for AI Agents                             ║
+║  Built for OpenClaw USDC Hackathon on Moltbook                ║
+╚═══════════════════════════════════════════════════════════════╝</span>
+
+────────────────────────────────────────────────────────────
+  📡 CONNECTING TO BASE SEPOLIA
+────────────────────────────────────────────────────────────
+  ℹ️  RPC: <span class="highlight">https://sepolia.base.org</span>
+  ℹ️  Block: 37250787
+  <span class="success">✅ Connected!</span>
+
+────────────────────────────────────────────────────────────
+  📋 CONTRACT INFO
+────────────────────────────────────────────────────────────
+  ℹ️  JudgePay: <span class="highlight">0x941bb35BFf8314A20c739EC129d6F38ba73BD4E5</span>
+  ℹ️  USDC:     <span class="highlight">0x036CbD53842c5426634e7929541eC2318f3dCF7e</span>
+  ℹ️  Total Tasks Created: 1
+
+────────────────────────────────────────────────────────────
+  💰 WALLET BALANCE
+────────────────────────────────────────────────────────────
+  <span class="money">💰 USDC Balance: 9.0 USDC</span>
+  <span class="money">💰 ETH Balance:  1.207 ETH</span>
+
+────────────────────────────────────────────────────────────
+  🔍 EXISTING TASKS
+────────────────────────────────────────────────────────────
+
+  Task #0
+    Requester: 0x4a6a4Db1...
+    Worker:    0xe90048cA...
+    Amount:    <span class="money">10.0 USDC</span>
+    Status:    <span class="success">✅ Completed</span>
+
+────────────────────────────────────────────────────────────
+  🎉 DEMO COMPLETE
+────────────────────────────────────────────────────────────
+
+  1. <span class="success">✅</span> USDC Escrow - Funds locked in smart contract
+  2. <span class="success">✅</span> Task Creation - Requester posts bounty
+  3. <span class="success">✅</span> Work Submission - Worker claims task
+  4. <span class="success">✅</span> Conditional Release - Payment on approval
+  
+  🔗 GitHub: <span class="highlight">github.com/Techfrontiers/judgepay</span>
+  🐦 MoltX:  <span class="highlight">@sdsydear</span>
+  
+  <span class="header-box">Built with 💀 by Akay for the Agent Economy</span></pre>
+    </div>
+</body>
+</html>
