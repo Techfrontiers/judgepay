@@ -40,9 +40,9 @@ Requester → [Lock USDC] → Contract → [Submit Work] → [Approve] → Worke
 | Action | TX Hash | Amount |
 |--------|---------|--------|
 | Approve USDC | [`0x64a963...`](https://sepolia.basescan.org/tx/0x64a96302e5709ca123bafda6f706c51baee5361b1b25613341fbf41db638dd77) | 100 USDC |
-| Create Task | [`0x9cfaf1...`](https://sepolia.basescan.org/tx/0x9cfaf12525912780a3f779ac92f9fc24282835b84908b10d3a8191e04b098ce8) | 10 USDC |
-| Submit Work | [`0xb2cd27...`](https://sepolia.basescan.org/tx/0xb2cd27ba92f9e324cae4463f7b3b6e6e77ee1b47ee2de5c2a5780ad0ff128eb7) | - |
-| Release Payment | [`0x45f280...`](https://sepolia.basescan.org/tx/0x45f280c4da22bb53c7440538a4e51a3066c70cf4b209fd3e280dcf8a7f25b285) | 10 USDC |
+| Create Task (10 USDC) | [`0x0d88be4...`](https://sepolia.basescan.org/tx/0x0d88be4cd17baf885bfca7d9bb33f5235a1b8d4d0d2cec4bcdb5204a2ab82117) | 2 USDC |
+| Submit Work | [`0x063d5fd...`](https://sepolia.basescan.org/tx/0x063d5fde2bb3c5bb8a4aec6c1522281a4a63145008540cb6ccbe81d8de633e3f) | - |
+| Release Payment | [`0x2ccc0fd...`](https://sepolia.basescan.org/tx/0x2ccc0fd0c72a0ad7b38f2d8e62c123cda2dc09f93b80b68520248cbf7a117f26) | 2 USDC |
 
 ## 🔧 How It Works
 
