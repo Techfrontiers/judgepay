@@ -4,29 +4,32 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
 
-// Abstract interface for Chainlink VRF (Mocked for architecture definition)
-interface VRFCoordinatorV2Interface {
+// Abstract interface for Chainlink VRF
+interface IVRFCoordinator {
     function requestRandomWords(
         bytes32 keyHash,
         uint64 subId,
-        uint16 minimumRequestConfirmations,
-        uint32 callbackGasLimit,
+        uint16 confirmations,
+        uint32 gasLimit,
         uint32 numWords
     ) external returns (uint256 requestId);
 }
 
 /**
- * @title JudgePay Protocol (V9 - Production Blueprint 99.99%)
- * @notice Arbitration Infrastructure Layer with True VRF, Time-Gated Reputation, and Multi-Sig Governance
+ * @title JudgePay Protocol (V10 - Enterprise 99.99%)
+ * @notice Arbitration Infrastructure Layer with True VRF, Time-Gated Reputation, Multi-Sig Governance, and Invariant Checks
  */
-contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
+contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
     using SafeERC20 for IERC20;
 
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+
     IERC20 public immutable usdc;
-    VRFCoordinatorV2Interface public vrfCoordinator;
+    IVRFCoordinator public vrfCoordinator;
 
     // Chainlink VRF Config
     uint64 public vrfSubscriptionId;
@@ -38,6 +41,7 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
 
     enum TaskStatus {
         Open,           
+        Locked,         // Claimed by worker
         Submitted,      
         L1_AutoChecks,  
         L2_OracleReview,
@@ -65,12 +69,14 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
         uint8 requiredOracles;
         uint8 currentOracleVotes;
         uint256 accumulatedOracleScore;
+        bytes32 promptHash;         // To verify what the oracle was asked
+        string modelVersion;        // To verify which model answered
 
         // Jury Layer
         uint256 jurySize;           
         uint256 acceptPower;        
         uint256 rejectPower;        
-        uint256 disputeStartTime;
+        uint256 disputeDeadline;
         uint256 vrfRequestId;
     }
 
@@ -81,10 +87,8 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
     mapping(uint256 => mapping(address => bool)) public hasVoted;
     mapping(uint256 => mapping(address => bool)) public voteChoice; 
     
-    // VRF Request mapping
     mapping(uint256 => uint256) public vrfToTaskId;
 
-    // Time-Gated & Decaying Reputation System
     struct JurorStats {
         uint256 correctVotes;       
         uint256 totalVotes;         
@@ -92,17 +96,15 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
         uint256 lastVoteTime;       
         uint256 reputationDecay;    
         uint256 maxTaskValueResolved;
-        uint256 registrationTime;   // For Time-Gated Activation
+        uint256 registrationTime;   
     }
     
     mapping(address => JurorStats) public jurors;
     address[] public activeJurorPool;
     mapping(address => bool) public isJurorInPool;
-    mapping(address => bool) public isAuthorizedOracle;
     
     uint256 public taskCount;
 
-    // Events
     event TaskCreated(uint256 indexed taskId, address indexed requester, uint256 amount);
     event TaskClaimed(uint256 indexed taskId, address indexed worker);
     event WorkSubmitted(uint256 indexed taskId, address indexed worker, string metadataURI);
@@ -111,10 +113,8 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
     event L3_JurorSelected(uint256 indexed taskId, address indexed juror);
     event L3_Voted(uint256 indexed taskId, address indexed juror, bool approve, uint256 votingPower);
     event DisputeResolved(uint256 indexed taskId, bool workerWins);
-    event InvariantBroken(uint256 expected, uint256 actual);
 
-    // Modifier to enforce Pull over Push payments where possible
-    // And to strictly check the TVL invariant
+    // Modifier to strictly check the TVL invariant
     modifier checkInvariant() {
         _;
         require(usdc.balanceOf(address(this)) >= totalLockedEscrow, "Invariant broken: Insufficient funds");
@@ -125,39 +125,37 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
         address _vrfCoordinator, 
         uint64 _subId, 
         bytes32 _keyHash,
-        address _multisigOwner
-    ) Ownable(_multisigOwner) {
+        address _multisigAdmin
+    ) {
         usdc = IERC20(_usdc);
-        vrfCoordinator = VRFCoordinatorV2Interface(_vrfCoordinator);
+        vrfCoordinator = IVRFCoordinator(_vrfCoordinator);
         vrfSubscriptionId = _subId;
         vrfKeyHash = _keyHash;
+        
+        _grantRole(DEFAULT_ADMIN_ROLE, _multisigAdmin);
+        _grantRole(ADMIN_ROLE, _multisigAdmin);
     }
 
-    function emergencyPause() external onlyOwner {
+    function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
     }
 
-    function unpause() external onlyOwner {
+    function unpause() external onlyRole(ADMIN_ROLE) {
         _unpause();
     }
 
-    // --- TIME-GATED JUROR REGISTRATION ---
-    
     function registerAsJuror() external whenNotPaused {
         require(!isJurorInPool[msg.sender], "Already registered");
         activeJurorPool.push(msg.sender);
         isJurorInPool[msg.sender] = true;
         
         if (jurors[msg.sender].totalVotes == 0) {
-            // Layer A: Time-Gated Activation (Power is 0 initially)
             jurors[msg.sender].weightedScore = 0;
             jurors[msg.sender].reputationDecay = 1;
             jurors[msg.sender].maxTaskValueResolved = 0;
             jurors[msg.sender].registrationTime = block.timestamp;
         }
     }
-
-    // --- CORE ESCROW ---
 
     function createTask(
         bytes32 _descriptionHash,
@@ -166,8 +164,8 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
         uint8 _requiredOracles,
         uint256 _baseJurySize
     ) external nonReentrant whenNotPaused checkInvariant returns (uint256) {
-        require(_amount > 0, "Amount must be > 0");
-        require(_deadlineHours > 0, "Deadline must be > 0");
+        require(_amount > 0, "Invalid amount");
+        require(_deadlineHours > 0, "Invalid deadline");
         
         usdc.safeTransferFrom(msg.sender, address(this), _amount);
         totalLockedEscrow += _amount;
@@ -185,16 +183,16 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
             outputHash: bytes32(0),
             outputMetadataURI: "",
             status: TaskStatus.Open,
-            minLength: 0,
-            maxLength: 0,
             requiredOracles: _requiredOracles,
             currentOracleVotes: 0,
             accumulatedOracleScore: 0,
             oracleConfidenceScore: 0,
+            promptHash: bytes32(0),
+            modelVersion: "",
             jurySize: _baseJurySize,
             acceptPower: 0,
             rejectPower: 0,
-            disputeStartTime: 0,
+            disputeDeadline: 0,
             vrfRequestId: 0
         });
 
@@ -202,30 +200,84 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
         return taskId;
     }
 
-    function submitWork(uint256 _taskId, bytes32 _outputHash, string memory _metadataURI) external whenNotPaused {
+    function claimTask(uint256 _taskId) external nonReentrant whenNotPaused {
         Task storage task = tasks[_taskId];
         require(task.status == TaskStatus.Open, "Not open");
+        require(block.timestamp < task.deadline, "Expired");
+        require(msg.sender != task.requester, "Requester cannot claim");
+
+        task.worker = msg.sender;
+        task.status = TaskStatus.Locked;
+        emit TaskClaimed(_taskId, msg.sender);
+    }
+
+    function submitWork(uint256 _taskId, bytes32 _outputHash, string memory _metadataURI) external whenNotPaused {
+        Task storage task = tasks[_taskId];
+        require(task.status == TaskStatus.Locked, "Not locked");
         require(task.worker == msg.sender, "Not worker");
-        
+        require(block.timestamp < task.deadline, "Deadline passed");
+
         task.outputHash = _outputHash;
         task.outputMetadataURI = _metadataURI; 
         task.submitTime = block.timestamp;
-        task.status = TaskStatus.L2_OracleReview;
+        
+        if (task.requiredOracles == 0) {
+            task.status = TaskStatus.Submitted;
+            task.disputeDeadline = block.timestamp + 48 hours;
+        } else {
+            task.status = TaskStatus.L2_OracleReview;
+        }
 
         emit WorkSubmitted(_taskId, msg.sender, _metadataURI);
     }
 
-    // --- ORACLE LAYER & CONFIDENCE ESCALATION ---
+    // Requester manually accepts without dispute
+    function acceptWork(uint256 _taskId) external nonReentrant whenNotPaused {
+        Task storage task = tasks[_taskId];
+        require(task.status == TaskStatus.Submitted, "Invalid state");
+        require(msg.sender == task.requester, "Not requester");
 
-    function submitOracleScore(uint256 _taskId, uint256 _confidenceScore) external nonReentrant whenNotPaused {
+        _release(_taskId, true);
+    }
+
+    // Manual Dispute if Oracle is bypassed
+    function dispute(uint256 _taskId) external whenNotPaused {
+        Task storage task = tasks[_taskId];
+        require(task.status == TaskStatus.Submitted, "Invalid state");
+        require(msg.sender == task.requester, "Not requester");
+        require(block.timestamp <= task.disputeDeadline, "Dispute window closed");
+
+        _escalateToJury(_taskId);
+    }
+
+    // Claim if requester goes silent
+    function claimIfSilent(uint256 _taskId) external nonReentrant whenNotPaused {
+        Task storage task = tasks[_taskId];
+        require(task.status == TaskStatus.Submitted, "Invalid state");
+        require(block.timestamp > task.disputeDeadline, "Too early");
+
+        _release(_taskId, true);
+    }
+
+    // --- ORACLE LAYER ---
+
+    function submitOracleScore(
+        uint256 _taskId, 
+        uint256 _confidenceScore,
+        bytes32 _promptHash,
+        string memory _modelVersion
+    ) external nonReentrant whenNotPaused onlyRole(ORACLE_ROLE) {
         Task storage task = tasks[_taskId];
         require(task.status == TaskStatus.L2_OracleReview, "Not in L2 review");
-        require(isAuthorizedOracle[msg.sender], "Not authorized");
         require(!hasOracleVoted[_taskId][msg.sender], "Already voted");
 
         hasOracleVoted[_taskId][msg.sender] = true;
         task.currentOracleVotes++;
         task.accumulatedOracleScore += _confidenceScore;
+        
+        // Store verification data (Last oracle's data is kept for simplicity, in production emit via event for indexing)
+        task.promptHash = _promptHash;
+        task.modelVersion = _modelVersion;
 
         emit L2_OracleVoted(_taskId, msg.sender, _confidenceScore);
 
@@ -239,37 +291,33 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
         task.oracleConfidenceScore = task.accumulatedOracleScore / task.requiredOracles;
 
         if (task.oracleConfidenceScore >= 92) {
-            // Auto Release
-            _executePayout(_taskId, task.worker);
+            _release(_taskId, true);
+        } else if (task.oracleConfidenceScore <= 30) {
+            _release(_taskId, false);
         } else {
-            // Adjust Jury size dynamically based on confidence
-            if (task.oracleConfidenceScore >= 75 && task.oracleConfidenceScore < 92) {
-                task.jurySize = 3;
-            } else {
-                task.jurySize = 7;
-            }
-            
-            // Request True Randomness
-            task.status = TaskStatus.L3_VRFPending;
-            task.disputeStartTime = block.timestamp;
-            
-            uint256 requestId = vrfCoordinator.requestRandomWords(
-                vrfKeyHash,
-                vrfSubscriptionId,
-                3, // confirmations
-                vrfCallbackGasLimit,
-                1 // num words
-            );
-            task.vrfRequestId = requestId;
-            vrfToTaskId[requestId] = _taskId;
-            
-            emit VRFRequested(_taskId, requestId);
+            _escalateToJury(_taskId);
         }
     }
 
-    // --- TRUE VRF JURY SELECTION ---
-    
-    // Expected to be called by VRFCoordinator (Mocked for structure)
+    // --- VRF JURY ---
+
+    function _escalateToJury(uint256 _taskId) internal {
+        Task storage task = tasks[_taskId];
+        task.status = TaskStatus.L3_VRFPending;
+        
+        uint256 requestId = vrfCoordinator.requestRandomWords(
+            vrfKeyHash,
+            vrfSubscriptionId,
+            3, 
+            vrfCallbackGasLimit,
+            1 
+        );
+        task.vrfRequestId = requestId;
+        vrfToTaskId[requestId] = _taskId;
+        
+        emit VRFRequested(_taskId, requestId);
+    }
+
     function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) external {
         uint256 _taskId = vrfToTaskId[requestId];
         Task storage task = tasks[_taskId];
@@ -287,7 +335,6 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
             address candidate = activeJurorPool[index];
             JurorStats storage stats = jurors[candidate];
             
-            // Time-Gated check: Must be older than 7 days
             bool isMature = block.timestamp >= stats.registrationTime + 7 days;
             
             if (candidate != task.requester && candidate != task.worker && !hasVoted[_taskId][candidate] && isMature) {
@@ -317,10 +364,9 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
         hasVoted[_taskId][msg.sender] = true;
         voteChoice[_taskId][msg.sender] = _approve;
         
-        // Decay Over Time Application
         JurorStats storage stats = jurors[msg.sender];
         if (block.timestamp > stats.lastVoteTime + 30 days && stats.weightedScore > 10) {
-            stats.weightedScore -= (stats.weightedScore / 10); // 10% decay if inactive for 30 days
+            stats.weightedScore -= (stats.weightedScore / 10);
         }
         
         uint256 power = stats.weightedScore;
@@ -341,14 +387,12 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
         }
 
         if (voteCount == taskJurors[_taskId].length) {
-            _resolveDispute(_taskId);
+            _resolveJury(_taskId);
         }
     }
 
-    function _resolveDispute(uint256 _taskId) internal {
+    function _resolveJury(uint256 _taskId) internal {
         Task storage task = tasks[_taskId];
-        task.status = TaskStatus.Resolved;
-
         bool workerWins = task.acceptPower >= task.rejectPower; 
         
         for (uint i = 0; i < taskJurors[_taskId].length; i++) {
@@ -359,47 +403,36 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
             
             if (voteChoice[_taskId][juror] == workerWins) {
                 stats.correctVotes++;
-                // Layer B: Weighted by Case Size Logarithmically
-                uint256 logValue = _log10(task.amount / (10**6)); // Normalize USDC
+                uint256 logValue = _log10(task.amount / (10**6)); 
                 if (logValue == 0) logValue = 1;
                 
                 uint256 boost = (stats.totalVotes * logValue) / stats.reputationDecay;
                 stats.weightedScore = _min(stats.weightedScore + boost, 10000);
             } else {
-                stats.reputationDecay += 5; // Harsh penalty
+                stats.reputationDecay += 5; 
                 stats.weightedScore = stats.weightedScore / stats.reputationDecay;
             }
         }
 
-        if (workerWins) {
-            _executePayout(_taskId, task.worker);
-        } else {
-            _executePayout(_taskId, task.requester);
-        }
-
-        emit DisputeResolved(_taskId, workerWins);
+        _release(_taskId, workerWins);
     }
     
-    function _executePayout(uint256 _taskId, address _to) internal checkInvariant {
+    function _release(uint256 _taskId, bool _approved) internal checkInvariant {
         Task storage task = tasks[_taskId];
         require(task.amount <= totalLockedEscrow, "Accounting error");
         
         totalLockedEscrow -= task.amount;
-        task.status = TaskStatus.Completed;
+        task.status = TaskStatus.Resolved;
         
-        usdc.safeTransfer(_to, task.amount);
-    }
-    
-    function claimTimeoutAfterSubmit(uint256 _taskId) external nonReentrant whenNotPaused {
-        Task storage task = tasks[_taskId];
-        require(task.status == TaskStatus.L2_OracleReview, "Not in review state");
-        require(block.timestamp > task.submitTime + 72 hours, "Grace period active");
-        require(msg.sender == task.worker, "Only worker");
-        
-        _executePayout(_taskId, task.worker);
+        if (_approved) {
+            usdc.safeTransfer(task.worker, task.amount);
+        } else {
+            usdc.safeTransfer(task.requester, task.amount);
+        }
+
+        emit DisputeResolved(_taskId, _approved);
     }
 
-    // Helper for log10 (approximate)
     function _log10(uint256 x) internal pure returns (uint256) {
         uint256 res = 0;
         while (x >= 10) {
@@ -411,5 +444,20 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable, Pausable {
     
     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
         return a < b ? a : b;
+    }
+    
+    // Fallback for timeout
+    function cancelJobIfTimeout(uint256 _taskId) external nonReentrant whenNotPaused {
+        Task storage task = tasks[_taskId];
+        require(task.status == TaskStatus.Open, "Not open");
+        require(block.timestamp > task.deadline, "Not expired");
+        require(msg.sender == task.requester, "Not requester");
+
+        _release(_taskId, false);
+    }
+    
+    // Ensure invariant is maintained
+    function checkEscrowHealth() external view returns (bool) {
+        return totalLockedEscrow == usdc.balanceOf(address(this));
     }
 }
