@@ -32,6 +32,7 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
         uint256 amount;             // USDC amount in escrow
         uint256 createdAt;          // Task creation timestamp
         uint256 deadline;           // Deadline timestamp
+        uint256 submitTime;         // Timestamp when work was submitted
         bytes32 descriptionHash;    // Hash of task description
         bytes32 outputHash;         // Hash of submitted output
         TaskStatus status;          // Current status
@@ -51,61 +52,19 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
     uint256 public taskCount;
 
     // Events
-    event TaskCreated(
-        uint256 indexed taskId,
-        address indexed requester,
-        uint256 amount,
-        uint256 deadline
-    );
-    
-    event TaskClaimed(
-        uint256 indexed taskId,
-        address indexed worker
-    );
-    
-    event WorkSubmitted(
-        uint256 indexed taskId,
-        address indexed worker,
-        bytes32 outputHash
-    );
-    
-    event TaskEvaluated(
-        uint256 indexed taskId,
-        address indexed evaluator,
-        bool passed
-    );
-    
-    event TaskCompleted(
-        uint256 indexed taskId,
-        address indexed worker,
-        uint256 amount
-    );
-    
-    event TaskRefunded(
-        uint256 indexed taskId,
-        address indexed requester,
-        uint256 amount
-    );
-    
-    event DisputeRaised(
-        uint256 indexed taskId,
-        address indexed raiser
-    );
+    event TaskCreated(uint256 indexed taskId, address indexed requester, uint256 amount, uint256 deadline);
+    event TaskClaimed(uint256 indexed taskId, address indexed worker);
+    event WorkSubmitted(uint256 indexed taskId, address indexed worker, bytes32 outputHash);
+    event TaskEvaluated(uint256 indexed taskId, address indexed evaluator, bool passed);
+    event TaskCompleted(uint256 indexed taskId, address indexed worker, uint256 amount);
+    event TaskRefunded(uint256 indexed taskId, address indexed requester, uint256 amount);
+    event DisputeRaised(uint256 indexed taskId, address indexed raiser);
+    event DisputeResolved(uint256 indexed taskId, bool resolvedInFavorOfWorker);
 
     constructor(address _usdc) Ownable(msg.sender) {
         usdc = IERC20(_usdc);
     }
 
-    /**
-     * @notice Create a new task with USDC escrow
-     * @param _descriptionHash Hash of task description (stored off-chain)
-     * @param _amount USDC amount to escrow
-     * @param _deadlineHours Hours until deadline
-     * @param _evaluator Address of evaluator (address(0) for auto)
-     * @param _minLength Minimum output length (0 = no limit)
-     * @param _maxLength Maximum output length (0 = no limit)
-     * @param _requiredApprovals Number of approvals needed (0 = single)
-     */
     function createTask(
         bytes32 _descriptionHash,
         uint256 _amount,
@@ -117,8 +76,10 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
     ) external nonReentrant returns (uint256) {
         require(_amount > 0, "Amount must be > 0");
         require(_deadlineHours > 0, "Deadline must be > 0");
+        if (_evaluator == address(0)) {
+            require(_requiredApprovals == 0, "Auto-evaluator cannot require approvals");
+        }
 
-        // Transfer USDC to escrow
         usdc.safeTransferFrom(msg.sender, address(this), _amount);
 
         uint256 taskId = taskCount++;
@@ -130,6 +91,7 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
             amount: _amount,
             createdAt: block.timestamp,
             deadline: block.timestamp + (_deadlineHours * 1 hours),
+            submitTime: 0,
             descriptionHash: _descriptionHash,
             outputHash: bytes32(0),
             status: TaskStatus.Open,
@@ -140,82 +102,54 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
         });
 
         emit TaskCreated(taskId, msg.sender, _amount, tasks[taskId].deadline);
-        
         return taskId;
     }
 
-    /**
-     * @notice Claim an open task as worker
-     * @param _taskId Task ID to claim
-     */
     function claimTask(uint256 _taskId) external {
         Task storage task = tasks[_taskId];
-        
         require(task.status == TaskStatus.Open, "Task not open");
+        require(task.worker == address(0), "Task already claimed");
         require(block.timestamp < task.deadline, "Task expired");
         require(msg.sender != task.requester, "Requester cannot claim");
 
         task.worker = msg.sender;
-
         emit TaskClaimed(_taskId, msg.sender);
     }
 
-    /**
-     * @notice Submit work for a claimed task
-     * @param _taskId Task ID
-     * @param _outputHash Hash of the output
-     * @param _outputLength Actual length of output (for on-chain validation)
-     */
-    function submitWork(
-        uint256 _taskId,
-        bytes32 _outputHash,
-        uint256 _outputLength
-    ) external {
+    function submitWork(uint256 _taskId, bytes32 _outputHash, uint256 _outputLength) external {
         Task storage task = tasks[_taskId];
-        
         require(task.status == TaskStatus.Open, "Task not open");
         require(task.worker == msg.sender, "Not the worker");
         require(block.timestamp < task.deadline, "Deadline passed");
 
-        // Check length conditions on-chain
-        if (task.minLength > 0) {
-            require(_outputLength >= task.minLength, "Output too short");
-        }
-        if (task.maxLength > 0) {
-            require(_outputLength <= task.maxLength, "Output too long");
-        }
+        if (task.minLength > 0) require(_outputLength >= task.minLength, "Output too short");
+        if (task.maxLength > 0) require(_outputLength <= task.maxLength, "Output too long");
 
         task.outputHash = _outputHash;
+        task.submitTime = block.timestamp;
         task.status = TaskStatus.Submitted;
 
         emit WorkSubmitted(_taskId, msg.sender, _outputHash);
 
-        // If no evaluator required, auto-complete
         if (task.evaluator == address(0) && task.requiredApprovals == 0) {
             _completeTask(_taskId);
         }
     }
 
-    /**
-     * @notice Evaluate submitted work
-     * @param _taskId Task ID
-     * @param _approve Whether to approve the work
-     */
     function evaluate(uint256 _taskId, bool _approve) external {
         Task storage task = tasks[_taskId];
-        
         require(task.status == TaskStatus.Submitted, "Not submitted");
         
-        // Check evaluator permission
         if (task.evaluator != address(0)) {
             require(msg.sender == task.evaluator, "Not authorized evaluator");
+        } else {
+            require(msg.sender == task.requester, "Only requester can manual evaluate auto-task");
         }
 
         emit TaskEvaluated(_taskId, msg.sender, _approve);
 
         if (_approve) {
             if (task.requiredApprovals > 0) {
-                // Multi-sig mode
                 require(!approvals[_taskId][msg.sender], "Already approved");
                 approvals[_taskId][msg.sender] = true;
                 task.currentApprovals++;
@@ -224,7 +158,6 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
                     _completeTask(_taskId);
                 }
             } else {
-                // Single evaluator mode
                 _completeTask(_taskId);
             }
         } else {
@@ -232,78 +165,64 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
         }
     }
 
-    /**
-     * @notice Raise a dispute (triggers multi-agent review)
-     * @param _taskId Task ID
-     */
     function raiseDispute(uint256 _taskId) external {
         Task storage task = tasks[_taskId];
-        
-        require(
-            task.status == TaskStatus.Submitted,
-            "Can only dispute submitted work"
-        );
-        require(
-            msg.sender == task.requester || msg.sender == task.worker,
-            "Not party to task"
-        );
+        require(task.status == TaskStatus.Submitted, "Can only dispute submitted work");
+        require(msg.sender == task.requester || msg.sender == task.worker, "Not party to task");
 
         task.status = TaskStatus.Disputed;
-
         emit DisputeRaised(_taskId, msg.sender);
     }
+    
+    function resolveDispute(uint256 _taskId, bool _favorWorker) external onlyOwner {
+        Task storage task = tasks[_taskId];
+        require(task.status == TaskStatus.Disputed, "Task not disputed");
+        
+        if (_favorWorker) {
+            _completeTask(_taskId);
+        } else {
+            _refundTask(_taskId);
+        }
+        
+        emit DisputeResolved(_taskId, _favorWorker);
+    }
 
-    /**
-     * @notice Claim refund if deadline passed without submission
-     * @param _taskId Task ID
-     */
     function claimTimeout(uint256 _taskId) external {
         Task storage task = tasks[_taskId];
-        
         require(task.status == TaskStatus.Open, "Task not open");
         require(block.timestamp > task.deadline, "Deadline not passed");
         require(msg.sender == task.requester, "Not requester");
 
         _refundTask(_taskId);
     }
+    
+    function claimTimeoutAfterSubmit(uint256 _taskId) external {
+        Task storage task = tasks[_taskId];
+        require(task.status == TaskStatus.Submitted, "Not submitted");
+        require(block.timestamp > task.submitTime + 48 hours, "Grace period active");
+        require(msg.sender == task.worker, "Only worker can claim timeout after submit");
+        
+        _completeTask(_taskId);
+    }
 
-    /**
-     * @dev Internal: Complete task and release USDC to worker
-     */
     function _completeTask(uint256 _taskId) internal {
         Task storage task = tasks[_taskId];
-        
         task.status = TaskStatus.Completed;
         usdc.safeTransfer(task.worker, task.amount);
-
         emit TaskCompleted(_taskId, task.worker, task.amount);
     }
 
-    /**
-     * @dev Internal: Refund task and return USDC to requester
-     */
     function _refundTask(uint256 _taskId) internal {
         Task storage task = tasks[_taskId];
-        
         task.status = TaskStatus.Refunded;
         usdc.safeTransfer(task.requester, task.amount);
-
         emit TaskRefunded(_taskId, task.requester, task.amount);
     }
 
-    /**
-     * @notice Get task details
-     * @param _taskId Task ID
-     */
     function getTask(uint256 _taskId) external view returns (Task memory) {
         return tasks[_taskId];
     }
 
-    /**
-     * @notice Check if address has approved a task
-     * @param _taskId Task ID
-     * @param _evaluator Evaluator address
-     */
     function hasApproved(uint256 _taskId, address _evaluator) external view returns (bool) {
         return approvals[_taskId][_evaluator];
     }

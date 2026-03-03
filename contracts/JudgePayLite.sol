@@ -20,6 +20,7 @@ contract JudgePayLite {
         address worker;
         uint96 amount;
         uint40 deadline;
+        uint40 submitTime;
         Status status;
     }
     
@@ -45,6 +46,7 @@ contract JudgePayLite {
             worker: address(0),
             amount: _amount,
             deadline: uint40(block.timestamp + _deadlineHours * 1 hours),
+            submitTime: 0,
             status: Status.Open
         });
         
@@ -59,6 +61,7 @@ contract JudgePayLite {
         require(msg.sender != t.requester, "Requester!=worker");
         
         t.worker = msg.sender;
+        t.submitTime = uint40(block.timestamp);
         t.status = Status.Submitted;
         emit WorkSubmitted(_id, msg.sender);
     }
@@ -77,6 +80,7 @@ contract JudgePayLite {
         Task storage t = tasks[_id];
         require(t.status == Status.Submitted, "Not submitted");
         require(msg.sender == t.requester, "Only requester");
+        require(block.timestamp > t.submitTime + 24 hours, "24h review period active");
         
         t.status = Status.Refunded;
         require(usdc.transfer(t.requester, t.amount), "Transfer failed");
@@ -94,14 +98,11 @@ contract JudgePayLite {
         emit TaskRefunded(_id, t.amount);
     }
     
-    /// @notice Claim funds if requester abandons after worker submitted
-    /// @dev Grace period: 48 hours after original deadline
     function claimTimeoutAfterSubmit(uint256 _id) external {
         Task storage t = tasks[_id];
         require(t.status == Status.Submitted, "Not submitted");
         require(block.timestamp > t.deadline + 48 hours, "Grace period active");
         
-        // Worker gets paid - they did the work, requester abandoned
         t.status = Status.Completed;
         require(usdc.transfer(t.worker, t.amount), "Transfer failed");
         emit TaskCompleted(_id, t.amount);
