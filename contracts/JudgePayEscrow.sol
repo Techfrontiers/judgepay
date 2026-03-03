@@ -7,8 +7,8 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
- * @title JudgePayEscrow (V3 - Trustless with Jury Incentives)
- * @notice Conditional USDC execution for AI agents with staking, random jury, and positive incentives
+ * @title JudgePayEscrow (V4 - Dynamic Gas Subsidized Jury)
+ * @notice Conditional USDC execution for AI agents with gas-conscious jury economics
  */
 contract JudgePayEscrow is ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
@@ -16,20 +16,21 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
     IERC20 public immutable usdc;
 
     enum TaskStatus {
-        Open,           // Waiting for worker
-        Submitted,      // Work submitted, pending evaluation
-        Completed,      // Conditions met, USDC released
-        Refunded,       // Conditions failed or timeout, USDC returned
-        Disputed,       // Under multi-agent review (Jury)
-        Resolved        // Dispute settled by Jury
+        Open,           
+        Submitted,      
+        Completed,      
+        Refunded,       
+        Disputed,       
+        Resolved        
     }
 
     struct Task {
         address requester;          
         address worker;             
-        uint256 amount;             // Task budget
-        uint256 workerStake;        // Required stake from worker
-        uint256 disputeFee;         // Fee paid by the loser of the dispute to reward jurors
+        uint256 amount;             
+        uint256 workerStake;        
+        uint256 disputeFee;         // The bounty paid by the loser to the jurors
+        uint256 gasSubsidy;         // Extra fee paid upfront by both to cover juror gas costs
         uint256 createdAt;          
         uint256 deadline;           
         uint256 submitTime;         
@@ -40,29 +41,29 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
         uint256 maxLength;          
         
         // Jury System
-        uint256 jurySize;           // Number of jurors needed (e.g., 3 or 5)
-        uint256 jurorStake;         // Small anti-spam stake required per juror (can be 0)
-        uint256 acceptVotes;        // Votes to approve
-        uint256 rejectVotes;        // Votes to reject
+        uint256 jurySize;           
+        uint256 jurorStake;         // Must be >= disputeFee / jurySize to prevent Sybil
+        uint256 acceptVotes;        
+        uint256 rejectVotes;        
         uint256 disputeStartTime;
     }
 
     mapping(uint256 => Task) public tasks;
     mapping(uint256 => address[]) public taskJurors;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
-    mapping(uint256 => mapping(address => bool)) public voteChoice; // true = accept, false = reject
+    mapping(uint256 => mapping(address => bool)) public voteChoice; 
     
     uint256 public taskCount;
 
     // Events
-    event TaskCreated(uint256 indexed taskId, address indexed requester, uint256 amount, uint256 workerStake, uint256 disputeFee, uint256 deadline);
+    event TaskCreated(uint256 indexed taskId, address indexed requester, uint256 amount);
     event TaskClaimed(uint256 indexed taskId, address indexed worker);
-    event WorkSubmitted(uint256 indexed taskId, address indexed worker, bytes32 outputHash);
+    event WorkSubmitted(uint256 indexed taskId, address indexed worker);
     event TaskApproved(uint256 indexed taskId);
     event DisputeRaised(uint256 indexed taskId, address indexed raiser);
     event JurorJoined(uint256 indexed taskId, address indexed juror);
     event Voted(uint256 indexed taskId, address indexed juror, bool approve);
-    event DisputeResolved(uint256 indexed taskId, bool approved);
+    event DisputeResolved(uint256 indexed taskId, bool workerWins);
 
     constructor(address _usdc) Ownable(msg.sender) {
         usdc = IERC20(_usdc);
@@ -73,6 +74,7 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
         uint256 _amount,
         uint256 _workerStake,
         uint256 _disputeFee,
+        uint256 _gasSubsidy,
         uint256 _deadlineHours,
         uint256 _minLength,
         uint256 _maxLength,
@@ -80,11 +82,13 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
         uint256 _jurorStake
     ) external nonReentrant returns (uint256) {
         require(_amount > 0, "Amount must be > 0");
+        require(_disputeFee >= 5 * 10**6, "Dispute fee must be at least 5 USDC");
         require(_deadlineHours > 0, "Deadline must be > 0");
         require(_jurySize % 2 == 1, "Jury size must be odd");
         
-        // The requester must pre-fund the task amount AND their potential side of the dispute fee
-        usdc.safeTransferFrom(msg.sender, address(this), _amount + _disputeFee);
+        // Requester locks: Task Amount + Their side of Dispute Fee + Gas Subsidy for Jurors
+        uint256 totalRequesterDeposit = _amount + _disputeFee + _gasSubsidy;
+        usdc.safeTransferFrom(msg.sender, address(this), totalRequesterDeposit);
 
         uint256 taskId = taskCount++;
         
@@ -94,6 +98,7 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
             amount: _amount,
             workerStake: _workerStake,
             disputeFee: _disputeFee,
+            gasSubsidy: _gasSubsidy,
             createdAt: block.timestamp,
             deadline: block.timestamp + (_deadlineHours * 1 hours),
             submitTime: 0,
@@ -103,13 +108,13 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
             minLength: _minLength,
             maxLength: _maxLength,
             jurySize: _jurySize,
-            jurorStake: _jurorStake, // Can be set to 0 for free voting
+            jurorStake: _jurorStake, 
             acceptVotes: 0,
             rejectVotes: 0,
             disputeStartTime: 0
         });
 
-        emit TaskCreated(taskId, msg.sender, _amount, _workerStake, _disputeFee, tasks[taskId].deadline);
+        emit TaskCreated(taskId, msg.sender, _amount);
         return taskId;
     }
 
@@ -120,10 +125,10 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
         require(block.timestamp < task.deadline, "Expired");
         require(msg.sender != task.requester, "Requester cannot claim");
 
-        // Worker must stake their side of the dispute fee AND the performance stake
-        uint256 totalWorkerRequired = task.workerStake + task.disputeFee;
-        if (totalWorkerRequired > 0) {
-            usdc.safeTransferFrom(msg.sender, address(this), totalWorkerRequired);
+        // Worker locks: Performance Stake + Their side of Dispute Fee + Gas Subsidy for Jurors
+        uint256 totalWorkerDeposit = task.workerStake + task.disputeFee + task.gasSubsidy;
+        if (totalWorkerDeposit > 0) {
+            usdc.safeTransferFrom(msg.sender, address(this), totalWorkerDeposit);
         }
 
         task.worker = msg.sender;
@@ -143,7 +148,7 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
         task.submitTime = block.timestamp;
         task.status = TaskStatus.Submitted;
 
-        emit WorkSubmitted(_taskId, msg.sender, _outputHash);
+        emit WorkSubmitted(_taskId, msg.sender);
     }
 
     function approveWork(uint256 _taskId) external nonReentrant {
@@ -153,12 +158,14 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
 
         task.status = TaskStatus.Completed;
         
-        // Happy path: Worker gets Task Amount + Their Stake + Their Dispute Fee back
-        uint256 workerPayout = task.amount + task.workerStake + task.disputeFee;
+        // Happy path: No dispute happened.
+        // Worker gets: Task Amount + Worker Stake + Dispute Fee + Gas Subsidy (Full refund of deposits)
+        uint256 workerPayout = task.amount + task.workerStake + task.disputeFee + task.gasSubsidy;
         usdc.safeTransfer(task.worker, workerPayout);
 
-        // Requester gets their Dispute Fee back
-        usdc.safeTransfer(task.requester, task.disputeFee);
+        // Requester gets: Dispute Fee + Gas Subsidy back (Full refund of deposits)
+        uint256 requesterRefund = task.disputeFee + task.gasSubsidy;
+        usdc.safeTransfer(task.requester, requesterRefund);
         
         emit TaskApproved(_taskId);
     }
@@ -180,7 +187,6 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
         require(taskJurors[_taskId].length < task.jurySize, "Jury full");
         require(!hasVoted[_taskId][msg.sender], "Already in jury");
 
-        // Small anti-spam stake (can be configured to 0 by requester)
         if (task.jurorStake > 0) {
             usdc.safeTransferFrom(msg.sender, address(this), task.jurorStake);
         }
@@ -227,44 +233,47 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
 
         bool workerWins = task.acceptVotes > task.rejectVotes;
         
-        // Slashing pool comes from minority voters + the loser's dispute fee
-        uint256 slashPool = task.disputeFee; 
+        // The reward pool for jurors consists of:
+        // 1. The loser's dispute fee
+        // 2. Both parties' gas subsidies (to cover juror transaction costs)
+        uint256 jurorRewardPool = task.disputeFee + (task.gasSubsidy * 2); 
         
         for (uint i = 0; i < taskJurors[_taskId].length; i++) {
             address juror = taskJurors[_taskId][i];
             if (voteChoice[_taskId][juror] != workerWins) {
-                // Minority voter -> Slashed
-                slashPool += task.jurorStake;
+                // Minority voter -> Slashed! Their stake is added to the reward pool
+                jurorRewardPool += task.jurorStake;
             }
         }
 
         uint256 majorityCount = workerWins ? task.acceptVotes : task.rejectVotes;
-        uint256 jurorReward = 0;
+        uint256 payoutPerWinningJuror = 0;
         if (majorityCount > 0) {
-            jurorReward = slashPool / majorityCount;
+            payoutPerWinningJuror = jurorRewardPool / majorityCount;
         }
 
         for (uint i = 0; i < taskJurors[_taskId].length; i++) {
             address juror = taskJurors[_taskId][i];
             if (voteChoice[_taskId][juror] == workerWins) {
-                // Majority voter -> Gets their stake back + Reward (from loser's fee and slashed jurors)
-                usdc.safeTransfer(juror, task.jurorStake + jurorReward);
+                // Majority voter -> Gets their stake back + their share of the reward pool
+                usdc.safeTransfer(juror, task.jurorStake + payoutPerWinningJuror);
             }
         }
 
-        // 3. Payout to Parties
+        // Payout to Winning Party
         if (workerWins) {
             // Worker wins: Gets Task Amount + Worker Stake + Their Dispute Fee back
+            // (Their Gas Subsidy was spent to pay the jurors)
             usdc.safeTransfer(task.worker, task.amount + task.workerStake + task.disputeFee);
         } else {
             // Requester wins: Gets Task Amount + Their Dispute Fee + Worker's Performance Stake back
+            // (Their Gas Subsidy was spent to pay the jurors)
             usdc.safeTransfer(task.requester, task.amount + task.disputeFee + task.workerStake);
         }
 
         emit DisputeResolved(_taskId, workerWins);
     }
     
-    // Fallbacks
     function claimTimeout(uint256 _taskId) external nonReentrant {
         Task storage task = tasks[_taskId];
         require(task.status == TaskStatus.Open, "Not open");
@@ -272,7 +281,7 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
         require(msg.sender == task.requester, "Not requester");
 
         task.status = TaskStatus.Refunded;
-        usdc.safeTransfer(task.requester, task.amount + task.disputeFee);
+        usdc.safeTransfer(task.requester, task.amount + task.disputeFee + task.gasSubsidy);
     }
 
     function claimTimeoutAfterSubmit(uint256 _taskId) external nonReentrant {
@@ -283,8 +292,8 @@ contract JudgePayEscrow is ReentrancyGuard, Ownable {
         
         task.status = TaskStatus.Completed;
         // Worker gets everything if requester abandons
-        usdc.safeTransfer(task.worker, task.amount + task.workerStake + task.disputeFee);
+        usdc.safeTransfer(task.worker, task.amount + task.workerStake + task.disputeFee + task.gasSubsidy);
         // Requester gets their dispute fee back
-        usdc.safeTransfer(task.requester, task.disputeFee);
+        usdc.safeTransfer(task.requester, task.disputeFee + task.gasSubsidy);
     }
 }
