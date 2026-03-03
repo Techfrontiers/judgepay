@@ -7,7 +7,6 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 
-// Abstract interface for Chainlink VRF
 interface IVRFCoordinator {
     function requestRandomWords(
         bytes32 keyHash,
@@ -19,8 +18,8 @@ interface IVRFCoordinator {
 }
 
 /**
- * @title JudgePay Protocol (V10 - Enterprise 99.99%)
- * @notice Arbitration Infrastructure Layer with True VRF, Time-Gated Reputation, Multi-Sig Governance, and Invariant Checks
+ * @title JudgePay Protocol (V11 - Anti-Collusion & Cluster Detection Edition)
+ * @notice Added advanced Sybil resistance via Voting Correlation tracking and Multisig prep
  */
 contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
     using SafeERC20 for IERC20;
@@ -31,21 +30,19 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
     IERC20 public immutable usdc;
     IVRFCoordinator public vrfCoordinator;
 
-    // Chainlink VRF Config
     uint64 public vrfSubscriptionId;
     bytes32 public vrfKeyHash;
     uint32 public vrfCallbackGasLimit = 2000000;
     
-    // Total Value Locked Invariant
     uint256 public totalLockedEscrow;
 
     enum TaskStatus {
         Open,           
-        Locked,         // Claimed by worker
+        Locked,         
         Submitted,      
         L1_AutoChecks,  
         L2_OracleReview,
-        L3_VRFPending,  // Waiting for Chainlink VRF
+        L3_VRFPending,  
         L3_HumanJury,   
         Completed,      
         Refunded,       
@@ -64,15 +61,13 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
         string outputMetadataURI;   
         TaskStatus status;          
         
-        // Oracle Layer
         uint256 oracleConfidenceScore; 
         uint8 requiredOracles;
         uint8 currentOracleVotes;
         uint256 accumulatedOracleScore;
-        bytes32 promptHash;         // To verify what the oracle was asked
-        string modelVersion;        // To verify which model answered
+        bytes32 promptHash;         
+        string modelVersion;        
 
-        // Jury Layer
         uint256 jurySize;           
         uint256 acceptPower;        
         uint256 rejectPower;        
@@ -102,6 +97,12 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
     mapping(address => JurorStats) public jurors;
     address[] public activeJurorPool;
     mapping(address => bool) public isJurorInPool;
+
+    // --- ANTI-COLLUSION MODULE (Cluster Detection) ---
+    // Tracks how many times Juror A and Juror B voted on the SAME side in the SAME task
+    // mapping(JurorA => mapping(JurorB => correlationCount))
+    mapping(address => mapping(address => uint256)) public votingCorrelation;
+    uint256 public constant COLLUSION_THRESHOLD = 5; // If they vote identically 5 times, trigger penalty
     
     uint256 public taskCount;
 
@@ -113,8 +114,8 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
     event L3_JurorSelected(uint256 indexed taskId, address indexed juror);
     event L3_Voted(uint256 indexed taskId, address indexed juror, bool approve, uint256 votingPower);
     event DisputeResolved(uint256 indexed taskId, bool workerWins);
+    event CollusionDetected(address indexed jurorA, address indexed jurorB, uint256 timesCorrelated);
 
-    // Modifier to strictly check the TVL invariant
     modifier checkInvariant() {
         _;
         require(usdc.balanceOf(address(this)) >= totalLockedEscrow, "Invariant broken: Insufficient funds");
@@ -125,7 +126,7 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
         address _vrfCoordinator, 
         uint64 _subId, 
         bytes32 _keyHash,
-        address _multisigAdmin
+        address _multisigAdmin // EXPECTED TO BE A SAFE (GNOSIS) MULTISIG ADDRESS
     ) {
         usdc = IERC20(_usdc);
         vrfCoordinator = IVRFCoordinator(_vrfCoordinator);
@@ -231,7 +232,6 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
         emit WorkSubmitted(_taskId, msg.sender, _metadataURI);
     }
 
-    // Requester manually accepts without dispute
     function acceptWork(uint256 _taskId) external nonReentrant whenNotPaused {
         Task storage task = tasks[_taskId];
         require(task.status == TaskStatus.Submitted, "Invalid state");
@@ -240,7 +240,6 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
         _release(_taskId, true);
     }
 
-    // Manual Dispute if Oracle is bypassed
     function dispute(uint256 _taskId) external whenNotPaused {
         Task storage task = tasks[_taskId];
         require(task.status == TaskStatus.Submitted, "Invalid state");
@@ -250,7 +249,6 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
         _escalateToJury(_taskId);
     }
 
-    // Claim if requester goes silent
     function claimIfSilent(uint256 _taskId) external nonReentrant whenNotPaused {
         Task storage task = tasks[_taskId];
         require(task.status == TaskStatus.Submitted, "Invalid state");
@@ -275,7 +273,6 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
         task.currentOracleVotes++;
         task.accumulatedOracleScore += _confidenceScore;
         
-        // Store verification data (Last oracle's data is kept for simplicity, in production emit via event for indexing)
         task.promptHash = _promptHash;
         task.modelVersion = _modelVersion;
 
@@ -395,22 +392,40 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
         Task storage task = tasks[_taskId];
         bool workerWins = task.acceptPower >= task.rejectPower; 
         
-        for (uint i = 0; i < taskJurors[_taskId].length; i++) {
-            address juror = taskJurors[_taskId][i];
-            JurorStats storage stats = jurors[juror];
+        // Track Correlation to detect Collusion Rings
+        address[] memory currentJurors = taskJurors[_taskId];
+        
+        for (uint i = 0; i < currentJurors.length; i++) {
+            address jurorA = currentJurors[i];
+            JurorStats storage statsA = jurors[jurorA];
+            statsA.totalVotes++;
             
-            stats.totalVotes++;
+            // Check correlation with other jurors in this same task
+            for (uint j = i + 1; j < currentJurors.length; j++) {
+                address jurorB = currentJurors[j];
+                if (voteChoice[_taskId][jurorA] == voteChoice[_taskId][jurorB]) {
+                    votingCorrelation[jurorA][jurorB]++;
+                    votingCorrelation[jurorB][jurorA]++;
+                    
+                    // If they correlate too often, nuke their reputation
+                    if (votingCorrelation[jurorA][jurorB] >= COLLUSION_THRESHOLD) {
+                        statsA.weightedScore = 0; // Absolute reset
+                        jurors[jurorB].weightedScore = 0;
+                        emit CollusionDetected(jurorA, jurorB, votingCorrelation[jurorA][jurorB]);
+                    }
+                }
+            }
             
-            if (voteChoice[_taskId][juror] == workerWins) {
-                stats.correctVotes++;
+            if (voteChoice[_taskId][jurorA] == workerWins) {
+                statsA.correctVotes++;
                 uint256 logValue = _log10(task.amount / (10**6)); 
                 if (logValue == 0) logValue = 1;
                 
-                uint256 boost = (stats.totalVotes * logValue) / stats.reputationDecay;
-                stats.weightedScore = _min(stats.weightedScore + boost, 10000);
+                uint256 boost = (statsA.totalVotes * logValue) / statsA.reputationDecay;
+                statsA.weightedScore = _min(statsA.weightedScore + boost, 10000);
             } else {
-                stats.reputationDecay += 5; 
-                stats.weightedScore = stats.weightedScore / stats.reputationDecay;
+                statsA.reputationDecay += 5; 
+                statsA.weightedScore = statsA.weightedScore / statsA.reputationDecay;
             }
         }
 
@@ -446,7 +461,6 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
         return a < b ? a : b;
     }
     
-    // Fallback for timeout
     function cancelJobIfTimeout(uint256 _taskId) external nonReentrant whenNotPaused {
         Task storage task = tasks[_taskId];
         require(task.status == TaskStatus.Open, "Not open");
@@ -456,7 +470,6 @@ contract JudgePayEscrow is ReentrancyGuard, Pausable, AccessControl {
         _release(_taskId, false);
     }
     
-    // Ensure invariant is maintained
     function checkEscrowHealth() external view returns (bool) {
         return totalLockedEscrow == usdc.balanceOf(address(this));
     }
